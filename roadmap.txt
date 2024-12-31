@@ -1,4 +1,4 @@
-Phase 1: Data Source and Storage Setup
+Phase 1: Data Source and Storage Setup 
 
 Source Data Planning
 
@@ -6,10 +6,12 @@ Find suitable sample Excel data (consider sales, customer, or inventory data)
 Structure should be complex enough to demonstrate data warehousing skills
 Multiple related tables would be ideal to show dimensional modeling
 
+PHASE 1: Data Source and Storage Setup COMPLETE 
+
 
 AWS S3 Configuration
 
-Create an S3 bucket with appropriate permissions
+Create an S3 bucket with appropriate permissions 
 Plan folder structure (raw/landing zone, processed, archived)
 Consider versioning and lifecycle policies
 
