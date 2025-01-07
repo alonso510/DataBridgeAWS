@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Dict, List, Any, Tuple
+import time
 
 # Configure logging
 logger = logging.getLogger()
@@ -15,88 +16,96 @@ def clean_column_name(column: str) -> str:
     if not column:
         return "unnamed_column"
     cleaned = ''.join(c if c.isalnum() else '_' for c in str(column).lower())
-    # Handle columns that start with numbers
     if cleaned[0].isdigit():
         cleaned = 'col_' + cleaned
     return cleaned
 
 def detect_data_type(values: pd.Series) -> str:
-    """
-    Detect the most appropriate Redshift data type based on column values
-    """
+    """Detect the most appropriate Redshift data type based on column values"""
     try:
-        # Remove null values for type detection
         non_null_values = values.dropna()
         if len(non_null_values) == 0:
-            return 'VARCHAR(256)'  # Default for empty columns
+            return 'VARCHAR(256)'
         
-        # Check if datetime
         if pd.api.types.is_datetime64_any_dtype(values):
             return 'TIMESTAMP'
         
-        # Check if boolean
         if pd.api.types.is_bool_dtype(values):
             return 'BOOLEAN'
             
-        # Check if integer
         if pd.api.types.is_integer_dtype(values):
-            if values.min() >= -32768 and values.max() <= 32767:
-                return 'SMALLINT'
-            elif values.min() >= -2147483648 and values.max() <= 2147483647:
-                return 'INTEGER'
-            else:
-                return 'BIGINT'
+            return 'BIGINT'
                 
-        # Check if float
         if pd.api.types.is_float_dtype(values):
             return 'DECIMAL(18,2)'
             
-        # For text, determine appropriate VARCHAR length
         if pd.api.types.is_string_dtype(values):
             max_length = values.astype(str).str.len().max()
-            # Add buffer for safety
             varchar_length = min(max(max_length * 2, 256), 65535)
             return f'VARCHAR({varchar_length})'
             
-        # Default to VARCHAR if type is unknown
         return 'VARCHAR(256)'
         
     except Exception as e:
         logger.error(f"Error detecting data type: {str(e)}")
-        return 'VARCHAR(256)'  # Safe default
+        return 'VARCHAR(256)'
 
-def check_redshift_table_exists(redshift_data: boto3.client, 
-                              table_name: str) -> bool:
-    """Check if table exists in Redshift"""
+def wait_for_query_completion(redshift_data: boto3.client, statement_id: str, expect_results: bool = True) -> Dict:
+    """Wait for a Redshift query to complete and return results if expected"""
+    logger.info(f"Waiting for query {statement_id} to complete...")
+    while True:
+        status_response = redshift_data.describe_statement(Id=statement_id)
+        status = status_response['Status']
+        logger.info(f"Query status: {status}")
+        
+        if status == 'FINISHED':
+            if expect_results:
+                try:
+                    result = redshift_data.get_statement_result(Id=statement_id)
+                    logger.info("Query results received")
+                    return result
+                except redshift_data.exceptions.ResourceNotFoundException:
+                    logger.info("Query completed but no results to fetch")
+                    return None
+            return None
+        elif status in ['FAILED', 'ABORTED']:
+            error_message = status_response.get('Error', 'No error message provided')
+            raise Exception(f"Query failed with status {status}: {error_message}")
+        
+        time.sleep(5)
+
+def check_table_exists(redshift_data: boto3.client, table_name: str) -> bool:
+    """Check if table exists and return true/false"""
     try:
         sql = f"""
-        SELECT EXISTS (
-            SELECT 1 
-            FROM information_schema.tables 
-            WHERE table_name = '{table_name}'
-        );
+        SELECT COUNT(*) 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = '{table_name}';
         """
+        
         response = redshift_data.execute_statement(
             Database=os.environ['REDSHIFT_DATABASE'],
             WorkgroupName=os.environ['REDSHIFT_WORKGROUP'],
             Sql=sql
         )
-        logger.info(f"Table existence check response: {response}")
-        return True
+        
+        result = wait_for_query_completion(redshift_data, response['Id'])
+        if result and result.get('Records'):
+            count = int(result['Records'][0][0]['longValue'])
+            return count > 0
+        return False
+        
     except Exception as e:
-        logger.info(f"Table {table_name} does not exist: {str(e)}")
+        logger.error(f"Error checking table existence: {str(e)}")
         return False
 
-def create_table(redshift_data: boto3.client,
-                table_name: str,
-                df: pd.DataFrame) -> None:
+def create_table(redshift_data: boto3.client, table_name: str, df: pd.DataFrame) -> None:
     """Create table in Redshift based on DataFrame schema"""
     try:
-        # Clean column names and detect types
         columns = {clean_column_name(col): detect_data_type(df[col]) 
                   for col in df.columns}
         
-        # Generate CREATE TABLE SQL
         column_definitions = [f'"{col}" {dtype}' for col, dtype in columns.items()]
         create_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
@@ -106,26 +115,22 @@ def create_table(redshift_data: boto3.client,
         
         logger.info(f"Creating table with SQL: {create_table_sql}")
         
-        # Execute CREATE TABLE
         response = redshift_data.execute_statement(
             Database=os.environ['REDSHIFT_DATABASE'],
             WorkgroupName=os.environ['REDSHIFT_WORKGROUP'],
             Sql=create_table_sql
         )
-        logger.info(f"Create table response: {response}")
+        
+        wait_for_query_completion(redshift_data, response['Id'], expect_results=False)
+        logger.info(f"Table {table_name} created successfully")
         
     except Exception as e:
         logger.error(f"Error creating table: {str(e)}")
         raise
 
-def load_data_to_redshift(redshift_data: boto3.client,
-                         s3_client: boto3.client,
-                         table_name: str,
-                         bucket: str,
-                         key: str) -> None:
+def load_data_to_redshift(redshift_data: boto3.client, table_name: str, bucket: str, key: str) -> None:
     """Load data from S3 to Redshift using COPY command"""
     try:
-        # Construct COPY command
         copy_command = f"""
         COPY {table_name}
         FROM 's3://{bucket}/{key}'
@@ -134,51 +139,53 @@ def load_data_to_redshift(redshift_data: boto3.client,
         IGNOREHEADER 1
         FILLRECORD
         ACCEPTINVCHARS
-        TRUNCATECOLUMNS
         MAXERROR 100;
         """
         
         logger.info(f"Executing COPY command: {copy_command}")
         
-        # Execute COPY command
         copy_response = redshift_data.execute_statement(
             Database=os.environ['REDSHIFT_DATABASE'],
             WorkgroupName=os.environ['REDSHIFT_WORKGROUP'],
             Sql=copy_command
         )
-        logger.info(f"COPY command response: {copy_response}")
         
-        # Check for load errors
-        check_errors_sql = "SELECT * FROM stl_load_errors ORDER BY starttime DESC LIMIT 5;"
-        error_response = redshift_data.execute_statement(
+        wait_for_query_completion(redshift_data, copy_response['Id'], expect_results=False)
+        
+        # Verify data was loaded
+        verify_sql = f"SELECT COUNT(*) FROM {table_name};"
+        verify_response = redshift_data.execute_statement(
             Database=os.environ['REDSHIFT_DATABASE'],
             WorkgroupName=os.environ['REDSHIFT_WORKGROUP'],
-            Sql=check_errors_sql
+            Sql=verify_sql
         )
-        logger.info(f"Load errors check response: {error_response}")
         
+        result = wait_for_query_completion(redshift_data, verify_response['Id'])
+        if result and result.get('Records'):
+            row_count = int(result['Records'][0][0]['longValue'])
+            logger.info(f"Loaded {row_count} rows into {table_name}")
+            
+            if row_count == 0:
+                raise Exception(f"No data was loaded into {table_name}")
+        else:
+            raise Exception("Could not verify data load")
+            
     except Exception as e:
         logger.error(f"Error loading data: {str(e)}")
         raise
 
-def move_to_completed(s3_client: boto3.client,
-                     bucket: str,
-                     source_key: str) -> None:
+def move_to_completed(s3_client: boto3.client, bucket: str, source_key: str) -> None:
     """Move processed file to completed folder"""
     try:
-        # Generate new key for completed folder
         completed_key = source_key.replace('processed/', 'completed/')
         
-        # Copy to completed folder
         s3_client.copy_object(
             CopySource={'Bucket': bucket, 'Key': source_key},
             Bucket=bucket,
             Key=completed_key
         )
         
-        # Delete from processed folder
         s3_client.delete_object(Bucket=bucket, Key=source_key)
-        
         logger.info(f"Moved {source_key} to {completed_key}")
         
     except Exception as e:
@@ -187,35 +194,27 @@ def move_to_completed(s3_client: boto3.client,
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
-        # Initialize AWS clients
         s3 = boto3.client('s3')
         redshift_data = boto3.client('redshift-data')
         
-        # Get the triggering file details
         bucket = event['Records'][0]['s3']['bucket']['name']
         key = event['Records'][0]['s3']['object']['key']
         
         logger.info(f"Processing file {key} from bucket {bucket}")
         
         try:
-            # Read CSV file
             response = s3.get_object(Bucket=bucket, Key=key)
             csv_content = response['Body'].read().decode('utf-8')
             df = pd.read_csv(StringIO(csv_content))
             logger.info(f"Successfully read CSV with {len(df)} rows")
             
-            # Generate table name from file name
             file_name = os.path.splitext(os.path.basename(key))[0]
             table_name = clean_column_name(file_name)
             
-            # Create table if it doesn't exist
-            if not check_redshift_table_exists(redshift_data, table_name):
+            if not check_table_exists(redshift_data, table_name):
                 create_table(redshift_data, table_name, df)
             
-            # Load data
-            load_data_to_redshift(redshift_data, s3, table_name, bucket, key)
-            
-            # Move file to completed folder
+            load_data_to_redshift(redshift_data, table_name, bucket, key)
             move_to_completed(s3, bucket, key)
             
             return {
