@@ -53,7 +53,10 @@ def detect_data_type(values: pd.Series) -> str:
 def wait_for_query_completion(redshift_data: boto3.client, statement_id: str, expect_results: bool = True) -> Dict:
     """Wait for a Redshift query to complete and return results if expected"""
     logger.info(f"Waiting for query {statement_id} to complete...")
-    while True:
+    max_retries = 60  # 5 minutes maximum wait
+    retry_count = 0
+    
+    while retry_count < max_retries:
         status_response = redshift_data.describe_statement(Id=statement_id)
         status = status_response['Status']
         logger.info(f"Query status: {status}")
@@ -72,7 +75,10 @@ def wait_for_query_completion(redshift_data: boto3.client, statement_id: str, ex
             error_message = status_response.get('Error', 'No error message provided')
             raise Exception(f"Query failed with status {status}: {error_message}")
         
+        retry_count += 1
         time.sleep(5)
+    
+    raise Exception("Query timed out waiting for completion")
 
 def check_table_exists(redshift_data: boto3.client, table_name: str) -> bool:
     """Check if table exists and return true/false"""
@@ -192,43 +198,105 @@ def move_to_completed(s3_client: boto3.client, bucket: str, source_key: str) -> 
         logger.error(f"Error moving file to completed: {str(e)}")
         raise
 
+def list_processed_files(s3_client: boto3.client, bucket: str) -> List[str]:
+    """List all CSV files currently in processed folder"""
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix='processed/'
+        )
+        csv_files = [item['Key'] for item in response.get('Contents', []) 
+                    if item['Key'].lower().endswith('.csv')]
+        logger.info(f"Found {len(csv_files)} CSV files in processed folder")
+        return csv_files
+    except Exception as e:
+        logger.error(f"Error listing files: {str(e)}")
+        return []
+
+def wait_for_file_processing(s3_client: boto3.client, bucket: str, max_wait_time: int = 300) -> List[str]:
+    """
+    Wait for all Excel to CSV conversions to complete.
+    Returns list of files to process once no new files appear for 60 seconds.
+    """
+    previous_files = set()
+    stable_count = 0
+    start_time = time.time()
+    
+    while (time.time() - start_time) < max_wait_time:
+        current_files = set(list_processed_files(s3_client, bucket))
+        
+        if current_files == previous_files:
+            stable_count += 1
+            logger.info(f"File list stable for {stable_count * 5} seconds")
+            if stable_count >= 12:  # 12 * 5 seconds = 60 seconds of stability
+                logger.info("File list has been stable for 60 seconds")
+                return list(current_files)
+        else:
+            stable_count = 0
+            previous_files = current_files
+            logger.info(f"File list changed, resetting stability counter")
+        
+        time.sleep(5)
+    
+    logger.warning(f"Reached maximum wait time of {max_wait_time} seconds")
+    return list(previous_files)
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         s3 = boto3.client('s3')
         redshift_data = boto3.client('redshift-data')
         
         bucket = event['Records'][0]['s3']['bucket']['name']
-        key = event['Records'][0]['s3']['object']['key']
+        triggering_key = event['Records'][0]['s3']['object']['key']
+        logger.info(f"Triggered by file: {triggering_key}")
         
-        logger.info(f"Processing file {key} from bucket {bucket}")
+        # Wait for all files to be processed
+        logger.info("Waiting for all Excel to CSV conversions to complete...")
+        files_to_process = wait_for_file_processing(s3, bucket)
+        logger.info(f"Found {len(files_to_process)} files to process: {files_to_process}")
         
-        try:
-            response = s3.get_object(Bucket=bucket, Key=key)
-            csv_content = response['Body'].read().decode('utf-8')
-            df = pd.read_csv(StringIO(csv_content))
-            logger.info(f"Successfully read CSV with {len(df)} rows")
-            
-            file_name = os.path.splitext(os.path.basename(key))[0]
-            table_name = clean_column_name(file_name)
-            
-            if not check_table_exists(redshift_data, table_name):
-                create_table(redshift_data, table_name, df)
-            
-            load_data_to_redshift(redshift_data, table_name, bucket, key)
-            move_to_completed(s3, bucket, key)
-            
-            return {
-                'statusCode': 200,
-                'body': f'Successfully processed {key} into table {table_name}'
+        processed_files = []
+        failed_files = []
+        
+        # Process each file
+        for key in files_to_process:
+            try:
+                logger.info(f"Processing file {key}")
+                
+                response = s3.get_object(Bucket=bucket, Key=key)
+                csv_content = response['Body'].read().decode('utf-8')
+                df = pd.read_csv(StringIO(csv_content))
+                logger.info(f"Successfully read CSV with {len(df)} rows")
+                
+                file_name = os.path.splitext(os.path.basename(key))[0]
+                table_name = clean_column_name(file_name)
+                
+                if not check_table_exists(redshift_data, table_name):
+                    create_table(redshift_data, table_name, df)
+                
+                load_data_to_redshift(redshift_data, table_name, bucket, key)
+                move_to_completed(s3, bucket, key)
+                
+                processed_files.append(key)
+                logger.info(f"Successfully processed {key}")
+                
+            except Exception as e:
+                logger.error(f"Error processing file {key}: {str(e)}")
+                failed_files.append({"file": key, "error": str(e)})
+                continue
+        
+        return {
+            'statusCode': 200,
+            'body': {
+                'message': f'Processed {len(processed_files)} files, {len(failed_files)} failures',
+                'processed': processed_files,
+                'failed': failed_files
             }
-            
-        except Exception as e:
-            logger.error(f"Error processing file {key}: {str(e)}")
-            raise
+        }
             
     except Exception as e:
         logger.error(f"Error in lambda_handler: {str(e)}")
         return {
             'statusCode': 500,
-            'body': f'Error processing file: {str(e)}'
+            'body': f'Error processing files: {str(e)}'
         }
