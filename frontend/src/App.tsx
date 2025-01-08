@@ -1,9 +1,9 @@
-import FileUpload from './components/FileUpload'
+import Dashboard from './components/Dashboard'
 
 function App() {
   return (
     <div className="App">
-      <FileUpload />
+      <Dashboard />
     </div>
   )
 }
