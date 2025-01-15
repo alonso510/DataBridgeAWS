@@ -118,9 +118,9 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 ---
 
 ## Contact 📬
-Your Name - [Your LinkedIn](https://linkedin.com/in/yourprofile)
+Your Name - [Your LinkedIn](https://www.linkedin.com/in/jose-nunez-444aa1232/)
 
-Project Link: [https://github.com/yourusername/project-name](https://github.com/yourusername/project-name)
+Project Link: [https://github.com/alonso510/DataBridgeAWS](https://github.com/alonso510/DataBridgeAWS)
 
 ---
 *Built with ❤️ using AWS Serverless*
