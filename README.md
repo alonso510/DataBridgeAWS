@@ -118,7 +118,7 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 ---
 
 ## Contact 📬
-Alonso Nunez - [LinkedIn](https://www.linkedin.com/in/jose-nunez-444aa1232/)
+Alonso Nunez - alonso510@proton.me
 
 Project Link: [https://github.com/alonso510/DataBridgeAWS](https://github.com/alonso510/DataBridgeAWS)
 
